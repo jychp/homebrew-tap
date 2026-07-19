@@ -7,11 +7,13 @@ on:
         description: Pull request number
         required: true
       head_sha:
-        description: Expected pull request head commit SHA (optional)
+        description: Expected pull request head commit SHA
+        required: true
 
 jobs:
   pr-pull:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       actions: read
       checks: read
@@ -23,9 +25,44 @@ jobs:
         uses: Homebrew/actions/setup-homebrew@1f8e202ffddf94def7f42f6fa3a482e821489f9c # 2026.07.10.1
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+        timeout-minutes: 10
 
       - name: Set up git
         uses: Homebrew/actions/git-user-config@1f8e202ffddf94def7f42f6fa3a482e821489f9c # 2026.07.10.1
+        timeout-minutes: 2
+
+      - name: Verify pull request head
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+          PULL_REQUEST: ${{ inputs.pull_request }}
+        run: |
+          if [[ ! "$PULL_REQUEST" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::Pull request must be a positive integer"
+            exit 1
+          fi
+          if [[ ! "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::head_sha must be a full lowercase commit SHA"
+            exit 1
+          fi
+
+          pull_request="$(
+            gh api \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "repos/${GITHUB_REPOSITORY}/pulls/${PULL_REQUEST}"
+          )"
+          actual_head_sha="$(jq -r '.head.sha' <<<"$pull_request")"
+          base_repository="$(jq -r '.base.repo.full_name' <<<"$pull_request")"
+          base_ref="$(jq -r '.base.ref' <<<"$pull_request")"
+          state="$(jq -r '.state' <<<"$pull_request")"
+          if [[ "$actual_head_sha" != "$HEAD_SHA" ]] ||
+             [[ "$base_repository" != "$GITHUB_REPOSITORY" ]] ||
+             [[ "$base_ref" != "main" ]] ||
+             [[ "$state" != "open" ]]; then
+            echo "::error::Pull request target, state, or head SHA no longer matches"
+            exit 1
+          fi
+        timeout-minutes: 2
 
       - name: Pull bottles
         env:
@@ -33,14 +70,14 @@ jobs:
           HEAD_SHA: ${{ inputs.head_sha }}
           PULL_REQUEST: ${{ inputs.pull_request }}
         run: |
-          if [[ -n "$HEAD_SHA" ]]
-          then
-            brew pr-pull --debug --tap="$GITHUB_REPOSITORY" --head-sha="$HEAD_SHA" "$PULL_REQUEST"
-          else
-            brew pr-pull --debug --tap="$GITHUB_REPOSITORY" "$PULL_REQUEST"
-          fi
+          brew pr-pull --debug \
+            --tap="$GITHUB_REPOSITORY" \
+            --head-sha="$HEAD_SHA" \
+            "$PULL_REQUEST"
+        timeout-minutes: 15
 
       - name: Push commits
         uses: Homebrew/actions/git-try-push@1f8e202ffddf94def7f42f6fa3a482e821489f9c # 2026.07.10.1
         with:
           branch: main
+        timeout-minutes: 5

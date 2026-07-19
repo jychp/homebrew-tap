@@ -8,14 +8,20 @@ on:
 
 jobs:
   test-bot:
+    name: test-bot (${{ matrix.label }})
     strategy:
       matrix:
-        os: [ macos-15-intel, macos-26 ]
         include:
-          - os: ubuntu-latest
-            container: ghcr.io/homebrew/brew:main
+          - label: macos-15-intel
+            os: macos-15-intel
+          - label: macos-26
+            os: macos-26
+          - label: ubuntu
+            os: ubuntu-latest
+            container: ghcr.io/homebrew/brew@sha256:ad3c35d771f8bda206e2ad30d7382dba2f324b1cf0aa84976334c4ebf6b4f616
     runs-on: ${{ matrix.os }}
     container: ${{ matrix.container }}
+    timeout-minutes: 30
     permissions:
       actions: read
       checks: read
@@ -27,21 +33,27 @@ jobs:
         uses: Homebrew/actions/setup-homebrew@1f8e202ffddf94def7f42f6fa3a482e821489f9c # 2026.07.10.1
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+        timeout-minutes: 10
 
       - name: Cache Homebrew Bundler RubyGems
-        uses: actions/cache@v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.0.3
         with:
           path: ${{ steps.set-up-homebrew.outputs.gems-path }}
           key: ${{ matrix.os }}-rubygems-${{ steps.set-up-homebrew.outputs.gems-hash }}
           restore-keys: ${{ matrix.os }}-rubygems-
+        timeout-minutes: 5
 
       - run: brew test-bot --only-cleanup-before
+        timeout-minutes: 5
 
       - run: brew test-bot --only-setup
+        timeout-minutes: 10
 
       - run: brew test-bot --only-tap-syntax
+        timeout-minutes: 10
       - run: brew test-bot --only-formulae
         if: github.event_name == 'pull_request'
+        timeout-minutes: 15
 
       - name: Upload bottles as artifact
         if: always() && github.event_name == 'pull_request'
@@ -49,6 +61,130 @@ jobs:
         with:
           name: bottles_${{ matrix.os }}
           path: '*.bottle.*'
+        timeout-minutes: 5
+
+  verify-elchango-automation:
+    name: Verify elChango automation PR
+    if: >-
+      startsWith(github.head_ref, 'automation/elchango-v') &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Check out automation head
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha }}
+        timeout-minutes: 5
+
+      - name: Verify immutable release regeneration
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD_REF: ${{ github.head_ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          SOURCE_REPOSITORY: jychp/elchango
+        run: |
+          if [[ ! "$HEAD_REF" =~ ^automation/elchango-v((0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*))(-[0-9]+)?$ ]]; then
+            echo "::error::Automation branch must identify one strict SemVer release"
+            exit 1
+          fi
+          version="${BASH_REMATCH[1]}"
+
+          mapfile -t changed_files < <(
+            git diff --name-only "$BASE_SHA" "$HEAD_SHA"
+          )
+          if (( ${#changed_files[@]} != 1 )) ||
+             [[ "${changed_files[0]}" != "Casks/elchango.rb" ]]; then
+            echo "::error::Automation PR must change only Casks/elchango.rb"
+            printf 'Changed file: %s\n' "${changed_files[@]}"
+            exit 1
+          fi
+
+          archive="elChango-${version}-macos-universal.zip"
+          checksum="${archive}.sha256"
+          release="$(
+            gh api \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "repos/${SOURCE_REPOSITORY}/releases/tags/v${version}"
+          )"
+          if [[ "$(jq -r '.immutable' <<<"$release")" != "true" ]] ||
+             [[ "$(jq -r '.draft' <<<"$release")" != "false" ]] ||
+             [[ "$(jq -r '.prerelease' <<<"$release")" != "false" ]]; then
+            echo "::error::Source release must be published, final, and immutable"
+            exit 1
+          fi
+
+          archive_count="$(
+            jq --arg name "$archive" \
+              '[.assets[] | select(.name == $name)] | length' <<<"$release"
+          )"
+          checksum_count="$(
+            jq --arg name "$checksum" \
+              '[.assets[] | select(.name == $name)] | length' <<<"$release"
+          )"
+          if [[ "$archive_count" != "1" || "$checksum_count" != "1" ]]; then
+            echo "::error::Immutable release must contain exactly one archive and checksum asset"
+            exit 1
+          fi
+
+          work_directory="$(mktemp -d)"
+          trap 'rm -rf "$work_directory"' EXIT
+          archive_id="$(
+            jq -r --arg name "$archive" \
+              '.assets[] | select(.name == $name) | .id' <<<"$release"
+          )"
+          checksum_id="$(
+            jq -r --arg name "$checksum" \
+              '.assets[] | select(.name == $name) | .id' <<<"$release"
+          )"
+          archive_digest="$(
+            jq -r --arg name "$archive" \
+              '.assets[] | select(.name == $name) | .digest' <<<"$release"
+          )"
+          checksum_digest="$(
+            jq -r --arg name "$checksum" \
+              '.assets[] | select(.name == $name) | .digest' <<<"$release"
+          )"
+          gh api -H "Accept: application/octet-stream" \
+            "repos/${SOURCE_REPOSITORY}/releases/assets/${archive_id}" \
+            > "$work_directory/$archive"
+          gh api -H "Accept: application/octet-stream" \
+            "repos/${SOURCE_REPOSITORY}/releases/assets/${checksum_id}" \
+            > "$work_directory/$checksum"
+
+          actual="$(sha256sum "$work_directory/$archive" | awk '{print $1}')"
+          actual_checksum="$(
+            sha256sum "$work_directory/$checksum" |
+              awk '{print $1}'
+          )"
+          expected="$(
+            awk -v archive="$archive" \
+              '$2 == archive {print $1}' \
+              "$work_directory/$checksum"
+          )"
+          if [[ "$archive_digest" != "sha256:${actual}" ]] ||
+             [[ "$checksum_digest" != "sha256:${actual_checksum}" ]] ||
+             [[ ! "$expected" =~ ^[0-9a-f]{64}$ ]] ||
+             [[ "$actual" != "$expected" ]]; then
+            echo "::error::Immutable release asset digests do not agree"
+            exit 1
+          fi
+
+          python3 .github/scripts/update_elchango_cask.py \
+            --version "$version" \
+            --sha256 "$actual" \
+            --output "$work_directory/elchango.rb"
+          if ! cmp --silent Casks/elchango.rb "$work_directory/elchango.rb"; then
+            echo "::error::Casks/elchango.rb is not exactly regenerated from the immutable release"
+            diff --unified Casks/elchango.rb "$work_directory/elchango.rb" || true
+            exit 1
+          fi
+        timeout-minutes: 5
 
   elchango-cask:
     name: elChango Cask (${{ matrix.os }})
@@ -69,9 +205,11 @@ jobs:
         uses: Homebrew/actions/setup-homebrew@1f8e202ffddf94def7f42f6fa3a482e821489f9c # 2026.07.10.1
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+        timeout-minutes: 10
 
       - name: Test Cask generator
         run: python3 .github/scripts/test_update_elchango_cask.py
+        timeout-minutes: 2
 
       - name: Detect elChango Cask
         id: cask
@@ -81,6 +219,7 @@ jobs:
           else
             echo "present=false" >> "$GITHUB_OUTPUT"
           fi
+        timeout-minutes: 1
 
       - name: Style and audit Cask
         if: steps.cask.outputs.present == 'true'
@@ -93,6 +232,7 @@ jobs:
           else
             brew audit --cask --new --online jychp/tap/elchango
           fi
+        timeout-minutes: 10
 
       - name: Install and verify Cask
         if: steps.cask.outputs.present == 'true'
@@ -102,12 +242,22 @@ jobs:
         run: |
           brew install --cask --require-sha jychp/tap/elchango
           test -d /Applications/elChango.app
+          team_identifier="$(
+            codesign -dv --verbose=4 /Applications/elChango.app 2>&1 |
+              awk -F= '$1 == "TeamIdentifier" {print $2}'
+          )"
+          if [[ "$team_identifier" != "82WC8Z37FG" ]]; then
+            echo "::error::Unexpected TeamIdentifier: ${team_identifier:-missing}"
+            exit 1
+          fi
           codesign --verify --deep --strict --verbose=2 \
             /Applications/elChango.app
           xcrun stapler validate /Applications/elChango.app
           spctl --assess --type execute --verbose=4 \
             /Applications/elChango.app
+        timeout-minutes: 10
 
       - name: Uninstall Cask
         if: always() && steps.cask.outputs.present == 'true'
         run: brew uninstall --cask elchango || true
+        timeout-minutes: 5
