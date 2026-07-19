@@ -16,7 +16,6 @@ jobs:
             container: ghcr.io/homebrew/brew:main
     runs-on: ${{ matrix.os }}
     container: ${{ matrix.container }}
-    options: ${{ matrix.container != '' && '--privileged' }}
     permissions:
       actions: read
       checks: read
@@ -46,7 +45,69 @@ jobs:
 
       - name: Upload bottles as artifact
         if: always() && github.event_name == 'pull_request'
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: bottles_${{ matrix.os }}
           path: '*.bottle.*'
+
+  elchango-cask:
+    name: elChango Cask (${{ matrix.os }})
+    if: github.event_name == 'pull_request'
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - macos-15-intel
+          - macos-26
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Set up Homebrew
+        id: set-up-homebrew
+        uses: Homebrew/actions/setup-homebrew@1f8e202ffddf94def7f42f6fa3a482e821489f9c # 2026.07.10.1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Test Cask generator
+        run: python3 .github/scripts/test_update_elchango_cask.py
+
+      - name: Detect elChango Cask
+        id: cask
+        run: |
+          if [[ -f Casks/elchango.rb ]]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Style and audit Cask
+        if: steps.cask.outputs.present == 'true'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          brew style jychp/tap/elchango
+          if git cat-file -e "${BASE_SHA}:Casks/elchango.rb" 2>/dev/null; then
+            brew audit --cask --online jychp/tap/elchango
+          else
+            brew audit --cask --new --online jychp/tap/elchango
+          fi
+
+      - name: Install and verify Cask
+        if: steps.cask.outputs.present == 'true'
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_FROM_API: "1"
+        run: |
+          brew install --cask --require-sha jychp/tap/elchango
+          test -d /Applications/elChango.app
+          codesign --verify --deep --strict --verbose=2 \
+            /Applications/elChango.app
+          xcrun stapler validate /Applications/elChango.app
+          spctl --assess --type execute --verbose=4 \
+            /Applications/elChango.app
+
+      - name: Uninstall Cask
+        if: always() && steps.cask.outputs.present == 'true'
+        run: brew uninstall --cask elchango || true

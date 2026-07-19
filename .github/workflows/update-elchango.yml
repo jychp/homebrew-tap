@@ -1,0 +1,128 @@
+name: Update elChango Cask
+
+on:
+  repository_dispatch:
+    types:
+      - elchango-release
+
+permissions:
+  contents: read
+
+concurrency:
+  group: update-elchango-${{ github.event.client_payload.version }}
+  cancel-in-progress: false
+
+jobs:
+  update:
+    name: Open and auto-merge Cask update
+    if: github.event.client_payload.repository == 'jychp/elchango'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out tap
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: true
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+
+      - name: Validate release and generate Cask
+        id: cask
+        env:
+          SOURCE_REPOSITORY: ${{ github.event.client_payload.repository }}
+          VERSION: ${{ github.event.client_payload.version }}
+        run: |
+          if [[ ! "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::Version must use strict SemVer"
+            exit 1
+          fi
+
+          archive="elChango-${VERSION}-macos-universal.zip"
+          release_root="https://github.com/${SOURCE_REPOSITORY}/releases/download/v${VERSION}"
+          work_directory="$(mktemp -d)"
+          trap 'rm -rf "$work_directory"' EXIT
+
+          curl --fail --location --silent --show-error \
+            --output "$work_directory/$archive" \
+            "$release_root/$archive"
+          curl --fail --location --silent --show-error \
+            --output "$work_directory/$archive.sha256" \
+            "$release_root/$archive.sha256"
+
+          expected="$(
+            awk -v archive="$archive" \
+              '$2 == archive {print $1}' \
+              "$work_directory/$archive.sha256"
+          )"
+          actual="$(
+            sha256sum "$work_directory/$archive" |
+              awk '{print $1}'
+          )"
+          if [[ ! "$expected" =~ ^[0-9a-f]{64}$ ]] ||
+             [[ "$actual" != "$expected" ]]; then
+            echo "::error::Published macOS checksum is invalid"
+            exit 1
+          fi
+          if ! unzip -Z1 "$work_directory/$archive" |
+               awk '$0 == "elChango.app/Contents/Info.plist" {found = 1}
+                    END {exit found ? 0 : 1}'; then
+            echo "::error::Archive does not contain elChango.app"
+            exit 1
+          fi
+
+          python3 .github/scripts/update_elchango_cask.py \
+            --version "$VERSION" \
+            --sha256 "$actual"
+          python3 .github/scripts/test_update_elchango_cask.py
+
+          if [[ -z "$(git status --porcelain -- Casks/elchango.rb)" ]]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "branch=automation/elchango-v${VERSION}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create update pull request
+        if: steps.cask.outputs.changed == 'true'
+        id: pull-request
+        env:
+          BRANCH: ${{ steps.cask.outputs.branch }}
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          VERSION: ${{ github.event.client_payload.version }}
+        run: |
+          existing="$(
+            gh pr list \
+              --head "$BRANCH" \
+              --state open \
+              --json url \
+              --jq '.[0].url // ""'
+          )"
+          if [[ -n "$existing" ]]; then
+            echo "url=$existing" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+            BRANCH="${BRANCH}-${GITHUB_RUN_ID}"
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$BRANCH"
+          git add Casks/elchango.rb
+          git commit -m "elchango ${VERSION}"
+          git push --set-upstream origin "$BRANCH"
+
+          url="$(
+            gh pr create \
+              --base main \
+              --head "$BRANCH" \
+              --title "elchango ${VERSION}" \
+              --body "Update the elChango Cask from the signed and notarized v${VERSION} GitHub release."
+          )"
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+
+      - name: Enable auto-merge
+        if: steps.pull-request.outputs.url != ''
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          PULL_REQUEST_URL: ${{ steps.pull-request.outputs.url }}
+        run: gh pr merge --auto --squash --delete-branch "$PULL_REQUEST_URL"
