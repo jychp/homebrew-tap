@@ -1,6 +1,6 @@
 cask "elchango" do
-  version "1.1.0"
-  sha256 "99678b964ad16b1e47b5a808ce239c6c41e45db7ed211a800bf291752b57ddec"
+  version "1.1.1"
+  sha256 "4c8af31d4d19ddb0cd02a532757ac0faca5c55eae820408a964ade9d95a35d51"
 
   url "https://github.com/jychp/elchango/releases/download/v#{version}/elChango-#{version}-macos-universal.zip"
   name "elChango"
